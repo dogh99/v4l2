@@ -1,0 +1,1 @@
+cmd_/home/megumi/linux/rk3568/v4l2/my_v4l2.ko := aarch64-none-linux-gnu-ld -r -EL  -maarch64elf -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/megumi/linux/rk3568/v4l2/my_v4l2.ko /home/megumi/linux/rk3568/v4l2/my_v4l2.o /home/megumi/linux/rk3568/v4l2/my_v4l2.mod.o;  make -f ./arch/arm64/Makefile.postlink /home/megumi/linux/rk3568/v4l2/my_v4l2.ko

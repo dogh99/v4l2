@@ -1,0 +1,2 @@
+/home/megumi/linux/rk3568/v4l2/my_v4l2.o
+

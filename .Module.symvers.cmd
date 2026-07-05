@@ -1,0 +1,1 @@
+cmd_/home/megumi/linux/rk3568/v4l2/Module.symvers := sed 's/\.ko$$/\.o/' /home/megumi/linux/rk3568/v4l2/modules.order | scripts/mod/modpost     -o /home/megumi/linux/rk3568/v4l2/Module.symvers -e -i Module.symvers   -T -
