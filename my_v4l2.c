@@ -15,6 +15,9 @@
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/ktime.h>
 
 #define V4L2_PIX_FMT_MYRAW \
     v4l2_fourcc('M', 'Y', 'R', 'W')  // 没有实际意义,只是格式名称的编码,4位
@@ -29,7 +32,7 @@ struct my_v4l2_dev {
     spinlock_t qlock;
     bool streaming;
     unsigned int sequence;
-
+    struct timer_list frame_timer;
 
     u32 width;
     u32 height;
@@ -47,6 +50,77 @@ struct imx415 {
     struct i2c_client* client;
 };
 
+
+static void my_fill_buffer(struct my_v4l2_dev *dev,
+                           struct my_v4l2_buffer *buf)
+//测试函数,将空buffer填满灰阶
+{
+    unsigned char *vaddr;
+    unsigned int x, y;
+    unsigned int width = dev->width;
+    unsigned int height = dev->height;
+    unsigned int stride = width * 2;
+
+    vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+    if (!vaddr)
+        return;
+
+    for (y = 0; y < height; y++) {
+        unsigned char *line = vaddr + y * stride;
+
+        for (x = 0; x < width; x += 2) {
+            unsigned char y0 = (x + dev->sequence) & 0xff;
+            unsigned char y1 = (y + dev->sequence) & 0xff;
+
+            line[x * 2 + 0] = y0;
+            line[x * 2 + 1] = 128;
+            line[x * 2 + 2] = y1;
+            line[x * 2 + 3] = 128;
+        }
+    }
+
+    buf->vb.vb2_buf.timestamp = ktime_get_ns();
+    buf->vb.sequence = dev->sequence++;
+    buf->vb.field = V4L2_FIELD_NONE;
+}
+
+
+
+
+
+static void my_frame_timer(struct timer_list* t)
+{
+    struct my_v4l2_dev *dev = from_timer(dev, t, frame_timer); //反推出dev
+    struct my_v4l2_buffer* buf = NULL;
+    unsigned long flags; //用来当前cpu的中断状态
+
+    if (!dev->streaming)
+    {
+        return;
+    }
+    spin_lock_irqsave(&dev->qlock, flags); //保存本地的硬中断状态,获取自旋锁并关闭中断
+    //解锁时不会无脑开中断,而是根据加锁前的状态(flags)恢复中断状态
+
+    if (!list_empty(&dev->buf_list))
+    {
+        buf = list_first_entry(&dev->buf_list, struct my_v4l2_buffer, list); //反推出双向链表的第一个buffer
+
+        list_del(&buf->list);
+    }
+    spin_unlock_irqrestore(&dev->qlock, flags);
+
+    if (buf)
+    {
+        my_fill_buffer(dev, buf);
+        vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+    }
+    
+    if (dev->streaming)
+        mod_timer(&dev->frame_timer, jiffies + msecs_to_jiffies(33));
+    
+}
+
+
 int my_v4l2_open(struct file* file) {
     v4l2_fh_open(
         file);  // fh是file
@@ -57,7 +131,7 @@ int my_v4l2_open(struct file* file) {
 }
 
 int my_v4l2_release(struct file* file) {
-    v4l2_fh_release(file);
+    v4l2_fop_release(file);
     return 0;
 }
 
@@ -82,7 +156,7 @@ int my_querycap(
             sizeof(cap->card));  // 安全字符串拷贝函数
     snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
              dev_name(dev->dev));
-    cap->device_caps = V4L2_CAP_VIDEO_CAPTURE;
+    cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
     cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
     return 0;
 }
@@ -190,30 +264,6 @@ int my_s_input(struct file* file, void* fh, unsigned int i) {   //切换输入�
 }
 
 
-static int my_vb2_init(struct my_v4l2_dev* dev){
-    int ret;
-    INIT_LIST_HEAD(&dev->buf_list);
-    spin_lock_init(&dev->qlock);
-
-    dev->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    dev->queue.io_modes = VB2_MMAP;
-    dev->queue.drv_priv = dev; //存放私有数据
-    dev->queue.buf_struct_size = sizeof(struct my_v4l2_buffer);
-    dev->queue.ops = &my_vb2_ops;
-
-    dev->queue.mem_ops = &vb2_vmalloc_memops; //这条视频队列的 buffer 内存，使用 vmalloc 方式来分配、映射和释放。
-    
-    dev->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-    dev->queue.lock = &dev->lock;
-
-    dev->queue.dev = &dev->dev;
-
-    ret = vb2_queue_init(&dev->queue);
-
-    return ret;
-}
-
-
 
 static int my_queue_setup(struct vb2_queue *q, //初始化的队列
                         unsigned int* num_buffers, //分配的buffer数量,来自用户态
@@ -271,6 +321,7 @@ static int my_start_streaming(struct vb2_queue *vq, unsigned int count)
 
     dev->streaming = true;
     dev->sequence = 0;
+    mod_timer(&dev->frame_timer, jiffies + msecs_to_jiffies(33));
 
     return 0;
 }
@@ -283,6 +334,7 @@ static void my_stop_streaming(struct vb2_queue *vq)
     unsigned long flags;
 
     dev->streaming = false;
+    del_timer_sync(&dev->frame_timer);
 
     spin_lock_irqsave(&dev->qlock, flags);
     list_for_each_entry_safe(buf, tmp, &dev->buf_list, list) {
@@ -305,6 +357,30 @@ static const struct vb2_ops my_vb2_ops = {
 };
 
 
+static int my_vb2_init(struct my_v4l2_dev* dev){
+    int ret;
+    INIT_LIST_HEAD(&dev->buf_list);
+    spin_lock_init(&dev->qlock);
+
+    timer_setup(&dev->frame_timer, my_frame_timer, 0);
+    dev->queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    dev->queue.io_modes = VB2_MMAP;
+    dev->queue.drv_priv = dev; //存放私有数据
+    dev->queue.buf_struct_size = sizeof(struct my_v4l2_buffer);
+    dev->queue.ops = &my_vb2_ops;
+
+    dev->queue.mem_ops = &vb2_vmalloc_memops; //这条视频队列的 buffer 内存，使用 vmalloc 方式来分配、映射和释放。
+    
+    dev->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+    dev->queue.lock = &dev->lock;
+
+    dev->queue.dev = dev->dev;
+
+    ret = vb2_queue_init(&dev->queue);
+
+    return ret;
+}
+
 
 
 static struct v4l2_ioctl_ops my_v4l2_ioctl_ops = {
@@ -317,7 +393,12 @@ static struct v4l2_ioctl_ops my_v4l2_ioctl_ops = {
     .vidioc_g_input = my_g_input,            // 查看当前输入源
     .vidioc_s_input = my_s_input,            // 设置输入源
 
-    .vidioc_reqbufs = vb2_ioctl_reqbufs,
+    .vidioc_reqbufs = vb2_ioctl_reqbufs,    //这些是vb2写好的函数,面向用户层的ioctl,他会进行一些通用的检查然后调用我们自己写的my_vb2_ops
+    .vidioc_querybuf = vb2_ioctl_querybuf,
+    .vidioc_qbuf = vb2_ioctl_qbuf,
+    .vidioc_dqbuf = vb2_ioctl_dqbuf,
+    .vidioc_streamon = vb2_ioctl_streamon,
+    .vidioc_streamoff = vb2_ioctl_streamoff,
 };
 
 static int my_v4l2_probe(struct platform_device* pdev) {
@@ -333,6 +414,14 @@ static int my_v4l2_probe(struct platform_device* pdev) {
     my_dev->height = 480;
     my_dev->pixelformat = V4L2_PIX_FMT_YUYV;
 
+
+    ret = my_vb2_init(my_dev);
+    if (ret) {
+        return ret;
+    }
+
+    my_dev->vdev.queue = &my_dev->queue;
+
     ret =
         v4l2_device_register(&pdev->dev, &my_dev->v4l2_dev);  // 注册v4l2_device
     if (ret) {
@@ -341,13 +430,12 @@ static int my_v4l2_probe(struct platform_device* pdev) {
     strscpy(my_dev->vdev.name, "my-v4l2", sizeof(my_dev->vdev.name));
     my_dev->vdev.v4l2_dev = &my_dev->v4l2_dev;  // 关联video_device与v4l2_dev
     my_dev->vdev.fops = &my_v4l2_ops;           // 分配操作符
-    my_dev->vdev.release =
-        video_device_release_empty;  // 这是一个空函数,适合struct video_device
+    my_dev->vdev.release = video_device_release_empty;  // 这是一个空函数,适合struct video_device
                                      // 嵌入到私有结构体的形式
                                      // vdev.release是释放回调
     my_dev->vdev.ioctl_ops = &my_v4l2_ioctl_ops;
     my_dev->vdev.lock = &my_dev->lock;
-    my_dev->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE;  // 申明能力
+    my_dev->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;  // 申明能力
 
     video_set_drvdata(&my_dev->vdev, my_dev);  // 设置私密数据
     platform_set_drvdata(pdev, my_dev);
@@ -361,12 +449,7 @@ static int my_v4l2_probe(struct platform_device* pdev) {
         return ret;
     }
 
-    ret = my_vb2_init(my_dev);
-    if (ret) {
-        v4l2_device_unregister(&my_dev->v4l2_dev);
-        return ret;
-    }
-    my_dev->vdev.queue = &my_dev->queue;
+    
 
 
     dev_info(&pdev->dev, "registered %s\n",
